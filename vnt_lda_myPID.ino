@@ -14,18 +14,18 @@
 #include <Wire.h> 
 #include <SoftwareSerial.h>  
 #include <SPI.h>
-#include <Adafruit_MAX31855.h>    // Use Adafruit library modified for a faster read time
-
+#include <Adafruit_MAX31855.h>
 #define PIN_BUTTON A5
 #define PIN_HEARTBEAT 13
 
+/* #define PIN_TEMP1 A0 */
 #define PIN_TEMP2 A3
 #define PIN_MAP A1
 #define PIN_TPS A0
 #define PIN_EMP A2
 
 #define PIN_RPM_TRIGGER 2
-#define PIN_VNT_N75 11    
+#define PIN_VNT_N75 6 //swapped with pin 11 for thermoCLK    
 #define PIN_AUX_N75 3
 #define PIN_OUTPUT1 7
 #define PIN_OUTPUT2 12
@@ -34,17 +34,15 @@
 
 #define LCD_FORCE_INIT 1
 
-// Pins for the EGT MAX31855
-#define doPin 4
-#define csPin 5
-#define clPin 6
+#define thermoCLK 11 //swapped with pin 6 for N75 output
+#define thermoCS 5
+#define thermoDO 4
 
+#define EGT_WARN 620
+#define EGT_ALARM 760
+#define EGT_MAX_READ 850
 
-#define EGT_WARN 700
-#define EGT_ALARM 775
-#define EGT_MAX_READ 1101
-
-#define IDLE_MAX_RPM 1150
+#define IDLE_MAX_RPM 1200
 
 /* Scaling factor for your sensors - 255 divided by this should equal the full scale deflection of your sensor */
 #define MAP_SCALING_KPA 0.977 
@@ -53,6 +51,16 @@
 /* Change this if you need to adjust the scaling of the PID outputs - ie if you need finer control at smaller fractional numbers increase this
  or if you need to have large multipliers then decrease this */
 #define PIDControlRatio 50
+
+/* RPM-based integral and proportional gain - change this value to alter the curve. Larger values will cause the integral scaling factor to back off
+ faster as RPM increases while smaller numbers will cause the integral to stay larger.
+ These should be moved in to the GUI settings rather than defined in code */
+/* Set rpmSpool to the RPM where your turbo starts to spool.  RPM proportional controls will be inactive below that RPM.  KiExp will adjust the
+ clipping for the integral component - we limit the maximum integral based on RPM.  Changing KiExp will adjust the shape of the curve.  KpExp
+ changes will adjust the proportional gain based on RPM */
+#define KiExp 0.75
+#define KpExp 0.3
+#define rpmSpool 1850
 
 /* Help reduce overshoot by increasing the falloff rate of the integral when we have a large error.  Whenever the positive error (overboost) exceeds this
  value the integral gain will be doubled causing the integral to decrease faster. */
@@ -71,42 +79,42 @@
 /* If boost is below spoolMinBoost then the turbo hasn't spooled yet - we don't start integrating till we see some signs of life otherwise we
  get all wound up.  preSpoolInt is a static value that the system will use till we see enough boost to start actually controlling things. 
  preSpoolProp is a static value */
-#define preSpoolInt 0.75
-#define preSpoolProp 0.25
+#define preSpoolInt 0.55
+#define preSpoolProp 0.45
 #define spoolMinBoost 10 // kpa
 
 /* Overshoot reduction - when we have a steep upwards slope and we're approaching the setpoint we'll start hacking away at the integral early */
 #define rampThreshold 0.025
-#define rampFactor 1.5
+#define rampFactor 2
 #define rampActive 0.20 // kPa value divided by max to yield percentage
 
 /* More overshoot reduction - when we have a steep upwards slope but we're below setpoint multiply Kp by underGain.  When we're over then use
    overGain */
-#define underGain 0.7
-#define overGain 1.3
+#define underGain 0.2
+#define overGain 2
 
 /* Fine control ratios */
 #define fineBand 0.03
 #define fineGain 0.5
 
 /* RPM Smoothing control */
-#define rpmSmoothing 0.5 // Value between >0 and 1.0 - the closer to 1.0 the less dampening and the faster the RPM values will respond
+#define rpmSmoothing 0.3 // Value between >0 and 1.0 - the closer to 1.0 the less dampening and the faster the RPM values will respond
 
 // Set up the LCD pin
 SoftwareSerial lcd = SoftwareSerial(0,PIN_LCD); 
 
 // Set up the thermocouple pins (Adafruit MAX31855 thermocouple interface)
-Adafruit_MAX31855 thermocouple(clPin, csPin, doPin);
-
+Adafruit_MAX31855 thermocouple(thermoCLK, thermoCS, thermoDO);
 
 // Set loop delay times
-#define SERIAL_DELAY 257 // ms
-#define EXEC_DELAY 80 //ms
-#define DISPLAY_DELAY 250 // ms
+#define SERIAL_DELAY 10 // ms 257
+#define EXEC_DELAY 10 //ms 80
+#define DISPLAY_DELAY 10 // ms 500
 
 
 // Calculate avarage values 
 #define AVG_MAX 20 
+#define EGT_AVG_MAX 3
 
 #define STATUS_IDLE 1
 #define STATUS_CRUISING 2
@@ -206,8 +214,8 @@ unsigned char tempCalibrationMap[] = {
 };
 
 // Also used in NVRAM data store magic header
-const unsigned char versionString[] PROGMEM  = "DMN-Vanbcguy Boost Ctrl v2.5a."; 
-const unsigned char statusString1[] PROGMEM  = " Active view: ";
+const prog_uchar versionString[] PROGMEM  = "DMN-Vanbcguy Boost Ctrl v2.5a."; 
+prog_uchar statusString1[] PROGMEM  = " Active view: ";
 
 #define OPTIONS_VANESOPENIDLE 1
 #define OPTIONS_VNTOUTPUTINVERTED 2
@@ -284,8 +292,13 @@ struct controlsStruct {
   float pidOutput;
   float prevPidOutput;
 
+  float rpmScale;
+  float maxIntegral;
+
   unsigned long lastTime;
   float lastInput;
+    //new variable for inverted output of N75 value - RGE
+  int invertedOut;
 };
 
 controlsStruct controls;
@@ -299,10 +312,11 @@ struct avgStruct {
 avgStruct tpsAvg;
 avgStruct mapAvg;
 avgStruct empAvg;
+avgStruct egtAvg;
 
 char buffer[100]; // general purpose buffer, mainly used for string storage when printing from flash
 unsigned long lastPacketTime;
-const unsigned char mapVisualitionHelp[] PROGMEM  = "Top Left is 0,0 (press: L - toggle live mode)";
+prog_uchar mapVisualitionHelp[] PROGMEM  = "Top Left is 0,0 (press: L - toggle live mode)";
 
 unsigned char page=0;
 char *pages[] = {
@@ -315,14 +329,14 @@ unsigned char *editorMaps1[]={
 unsigned char clearScreen[] =  { 
   27,'[','2','J',27,'[','H'};
 
-const unsigned char ANSIclearEol[] PROGMEM = {
+prog_uchar ANSIclearEol[] PROGMEM = {
   27,'[','K',0};
 
-const unsigned char ANSIclearEolAndLf[] PROGMEM = {
+prog_uchar ANSIclearEolAndLf[] PROGMEM = {
   27,'[','K','\r','\n',0};
-const unsigned char ANSIgoHome[] PROGMEM = {
+prog_uchar ANSIgoHome[] PROGMEM = {
   27,'[','1',';','1','H',0};
-const unsigned char ANSIclearEos[] PROGMEM = {
+prog_uchar ANSIclearEos[] PROGMEM = {
   27,'[','J',0};
 
 void setPwmFrequency(int pin, int divisor) {
@@ -397,7 +411,7 @@ unsigned long rpmMicros = 0;
 unsigned long teethSeconds = 0;
 
 void calcRpm() {
-  if (teethNo > rpmResolution) 
+  if (teethNo > rpmResolution); 
   {
     int rpm;
     
@@ -423,8 +437,9 @@ void gotoXY(char x,char y) {
 }
 
 void modeSelect() {
-  // This needs to be removed, we don't have a dual mode switch and most of the rest of the code is gone
-  
+
+  //  if (digitalRead(PIN_BUTTON_MODE_SELECT) == HIGH) {
+
   editorMaps = editorMaps1;
 
   auxMap = auxMap1;
@@ -522,9 +537,17 @@ void setup() {
   digitalWrite(PIN_RPM_TRIGGER,HIGH); // pullup for honeywell
 
   attachInterrupt(0, rpmTrigger, RISING); // or rising!
-    
-  setPwmFrequency(PIN_VNT_N75, 1024); // was 1024
-  setPwmFrequency(PIN_AUX_N75, 1024); // was 1024
+  
+  // Let's not mess with these right now since we're not using them
+  // setPwmFrequency(PIN_OUTPUT1, 64); // was 1024
+  // setPwmFrequency(PIN_OUTPUT2, 64); // was 1024
+  // pinMode(PIN_OUTPUT1,OUTPUT);
+  // pinMode(PIN_OUTPUT2,OUTPUT);
+  
+ setPwmFrequency(PIN_OUTPUT1, 64); // was 1024
+  setPwmFrequency(PIN_OUTPUT2, 64); // was 1024
+  setPwmFrequency(PIN_VNT_N75, 256); // was 1024
+  setPwmFrequency(PIN_AUX_N75, 64); // was 1024
 
   pinMode(PIN_VNT_N75,OUTPUT);
   pinMode(PIN_AUX_N75,OUTPUT);
@@ -558,6 +581,7 @@ void setup() {
   Serial.write(clearScreen,sizeof(clearScreen));
   tpsAvg.size=AVG_MAX;
   mapAvg.size=AVG_MAX;
+  egtAvg.size=EGT_AVG_MAX; 
 
   //initial setup of kp/ki/kd
   calcKp();
@@ -570,6 +594,8 @@ void setup() {
   layoutLCD();
 
   pageAbout(1); // force output
+  
+
 }
 
 void loadDefaults() {
@@ -700,7 +726,7 @@ char mapDebugCharValue(unsigned char c) {
 
 
 // Fetches and print string from flash to preserve some ram!
-void printFromFlash(const unsigned char *str) {
+void printFromFlash(prog_uchar *str) {
   strcpy_P(buffer, (PGM_P)str);   
   Serial.print(buffer);
 }
@@ -813,7 +839,7 @@ void printIntWithPadding(int val,unsigned char width,char padChar) {
   Serial.print(buffer+30+strlen(buffer+30)-width);
 }
 
-void printStringWithPadding(const unsigned char *str,unsigned char width,char padChar) {
+void printStringWithPadding(prog_uchar *str,unsigned char width,char padChar) {
   // print enough leading zeroes!
   memset(buffer,padChar,30);
   // append string presentation of number to end
@@ -829,11 +855,14 @@ void printPads(unsigned char n, char padChar) {
   Serial.print(buffer);
 }
 
+
+
+
 // User interface functions
 void pageHeader() {
   //Serial.write(clearScreen,sizeof(clearScreen));    
   printFromFlash(ANSIgoHome);
-  printFromFlash((const unsigned char*)versionString);  
+  printFromFlash((prog_uchar*)versionString);  
   Serial.print(" Mode:");
   Serial.print(controls.mode,DEC);
   Serial.print(" "); 
@@ -844,9 +873,9 @@ void pageHeader() {
 }
 
 // Stored in the 32kB FLASH
-const unsigned char aboutString1[] PROGMEM  = "(c) 2011-2014 Juho Pesonen. Visit http://dmn.kuulalaakeri.org/dmn-boost-control/";
-const unsigned char aboutString2[] PROGMEM  = "Press: <space> to jump next view, or press ...";
-const unsigned char aboutString3[] PROGMEM  = "Questions? Or feedback? Send mail to dmn@qla.fi";
+prog_uchar aboutString1[] PROGMEM  = "(c) 2011-2014 Juho Pesonen. Visit http://dmn.kuulalaakeri.org/dmn-boost-control/";
+prog_uchar aboutString2[] PROGMEM  = "Press: <space> to jump next view, or press ...";
+prog_uchar aboutString3[] PROGMEM  = "Questions? Or feedback? Send mail to dmn@qla.fi";
 
 void pageAbout(char key) {
 
@@ -879,42 +908,42 @@ void pageAbout(char key) {
 } 
 
 // TPS input: 200 Corrected: 0 (low:200, high:788);
-const unsigned char statusRPM[] PROGMEM  = "RPM actual:";
-const unsigned char statusCorrected[] PROGMEM  = " Corrected:";
-const unsigned char statusTPSinput[] PROGMEM  = "TPS input:";
-const unsigned char statusLow[] PROGMEM  = ":";
-const unsigned char statusMAPinput[] PROGMEM  = "MAP input:";
-const unsigned char statusVNTactOutput[] PROGMEM  = "VNT actuator output:";
-const unsigned char statusHeader[] PROGMEM  = "Sensor values and adaptation map limits (l=live, y=save, p/P=load, R=reset)";
+const prog_uchar statusRPM[] PROGMEM  = "RPM actual:";
+prog_uchar statusCorrected[] PROGMEM  = " Corrected:";
+prog_uchar statusTPSinput[] PROGMEM  = "TPS input:";
+prog_uchar statusLow[] PROGMEM  = ":";
+prog_uchar statusMAPinput[] PROGMEM  = "MAP input:";
+prog_uchar statusVNTactOutput[] PROGMEM  = "VNT actuator output:";
+prog_uchar statusHeader[] PROGMEM  = "Sensor values and adaptation map limits (l=live, y=save, p/P=load, R=reset)";
 //                                          0123456789012345678901234567890123456789012345678901234567890123456789
-const unsigned char statusTableHeader[] PROGMEM  = "        Raw val.  Corr.val. Map min.  Map max.  Mode";
-const unsigned char statusRowTPS[] PROGMEM = "TPS";
-const unsigned char statusRowMAP[] PROGMEM = "MAP";
-const unsigned char statusRowEMP[] PROGMEM = "EMP";
-const unsigned char statusRowEGT[] PROGMEM = "EGT";
-const unsigned char statusRowRPM[] PROGMEM = "RPM";
+prog_uchar statusTableHeader[] PROGMEM  = "        Raw val.  Corr.val. Map min.  Map max.  Mode";
+prog_uchar statusRowTPS[] PROGMEM = "TPS";
+prog_uchar statusRowMAP[] PROGMEM = "MAP";
+prog_uchar statusRowEMP[] PROGMEM = "EMP";
+prog_uchar statusRowEGT[] PROGMEM = "EGT";
+prog_uchar statusRowRPM[] PROGMEM = "RPM";
 
 //                                          0123456789012345678901234567890123456789012345678901234567890123456789
-const unsigned char statusVNTtableStyleDC[] PROGMEM =  "Duty cycle";
-const unsigned char statusVNTtableStyleMAP[] PROGMEM = "Target press.";
-const unsigned char statusOpenAtIdle[] PROGMEM = "VNT Open blades when idling C";
+prog_uchar statusVNTtableStyleDC[] PROGMEM =  "Duty cycle";
+prog_uchar statusVNTtableStyleMAP[] PROGMEM = "Target press.";
+prog_uchar statusOpenAtIdle[] PROGMEM = "VNT Open blades when idling C";
 
-const unsigned char statusNone[] PROGMEM = "-";
+prog_uchar statusNone[] PROGMEM = "-";
 
-const unsigned char statusSelected[] PROGMEM = "[X] ";
-const unsigned char statusUnSelected[] PROGMEM = "[ ] ";
-const unsigned char statusVNTOutputInverted[] PROGMEM = "VNT Output Inverted J";
-const unsigned char statusControlMethodDC[] PROGMEM =       "[X] BoostDCMin = output, [ ] PID, [ ] Simulate Actuator   M";
-const unsigned char statusControlMethodPID[] PROGMEM =      "[ ] BoostDCMin = output, [X] PID, [ ] Simulate Actuator   M";
-const unsigned char statusControlMethodActuator[] PROGMEM = "[ ] BoostDCMin = output, [ ] PID, [X] Simulate Actuator   M";
+prog_uchar statusSelected[] PROGMEM = "[X] ";
+prog_uchar statusUnSelected[] PROGMEM = "[ ] ";
+prog_uchar statusVNTOutputInverted[] PROGMEM = "VNT Output Inverted J";
+prog_uchar statusControlMethodDC[] PROGMEM =       "[X] BoostDCMin = output, [ ] PID, [ ] Simulate Actuator   M";
+prog_uchar statusControlMethodPID[] PROGMEM =      "[ ] BoostDCMin = output, [X] PID, [ ] Simulate Actuator   M";
+prog_uchar statusControlMethodActuator[] PROGMEM = "[ ] BoostDCMin = output, [ ] PID, [X] Simulate Actuator   M";
 
-const unsigned char statusTemp1[] PROGMEM = "Temp1";
-const unsigned char statusTemp2[] PROGMEM = "Temp2";
-const unsigned char statusC[] PROGMEM = "°C";
-const unsigned char statusOn[] PROGMEM = " (on)  ";
-const unsigned char statusOff[] PROGMEM = " (off) ";
-const unsigned char statusFooter[] PROGMEM = "To change adaptation value, press the letter after value.";
-const unsigned char statusFooter2[] PROGMEM = "For example: q = decrease 'Map Low' for TPS / Q increase 'Map Low' for TPS";
+prog_uchar statusTemp1[] PROGMEM = "Temp1";
+prog_uchar statusTemp2[] PROGMEM = "Temp2";
+prog_uchar statusC[] PROGMEM = "°C";
+prog_uchar statusOn[] PROGMEM = " (on)  ";
+prog_uchar statusOff[] PROGMEM = " (off) ";
+prog_uchar statusFooter[] PROGMEM = "To change adaptation value, press the letter after value.";
+prog_uchar statusFooter2[] PROGMEM = "For example: q = decrease 'Map Low' for TPS / Q increase 'Map Low' for TPS";
 
 char oldKey;
 bool isLive = true;
@@ -1129,14 +1158,14 @@ void pageStatusAndAdaption(char key) {
 }
 
 
-const unsigned char statusOutput1[] PROGMEM = "Output tests:";
-const unsigned char statusOutput2[] PROGMEM = "<Q> Set output VNT output to Map min. for 2 seconds, value=";
-const unsigned char statusOutput3[] PROGMEM = "<W> Set output VNT output to Map max. for 2 seconds, value=";
-const unsigned char statusOutput4[] PROGMEM = "<E> Sweep output VNT output between min & max";
+prog_uchar statusOutput1[] PROGMEM = "Output tests:";
+prog_uchar statusOutput2[] PROGMEM = "<Q> Set output VNT output to Map min. for 2 seconds, value=";
+prog_uchar statusOutput3[] PROGMEM = "<W> Set output VNT output to Map max. for 2 seconds, value=";
+prog_uchar statusOutput4[] PROGMEM = "<E> Sweep output VNT output between min & max";
 
 
-const unsigned char statusOutput8[] PROGMEM = "<Z> Enable OUTPUT1 for 2 seconds";
-const unsigned char statusOutput9[] PROGMEM = "<X> Enable OUTPUT2 for 2 seconds";
+prog_uchar statusOutput8[] PROGMEM = "<Z> Enable OUTPUT1 for 2 seconds";
+prog_uchar statusOutput9[] PROGMEM = "<X> Enable OUTPUT2 for 2 seconds";
 
 void pageOutputTests(char key) {
 
@@ -1204,11 +1233,11 @@ void pageOutputTests(char key) {
   }
 }
 
-const unsigned char exportConf[] PROGMEM = "Configuration dump:";
-const unsigned char exportVntMap[] PROGMEM = "VNT Map dump:";
-const unsigned char exportLdaMap[] PROGMEM = "LDA Map dump:";
-const unsigned char exportBoostDCMax[] PROGMEM = "VNT Max DC Map dump:";
-const unsigned char exportBoostDCMin[] PROGMEM = "VNT Min DC Map dump:";
+prog_uchar exportConf[] PROGMEM = "Configuration dump:";
+prog_uchar exportVntMap[] PROGMEM = "VNT Map dump:";
+prog_uchar exportLdaMap[] PROGMEM = "LDA Map dump:";
+prog_uchar exportBoostDCMax[] PROGMEM = "VNT Max DC Map dump:";
+prog_uchar exportBoostDCMin[] PROGMEM = "VNT Min DC Map dump:";
 
 void pageExport(char key) {
   if (key) {
@@ -1320,8 +1349,6 @@ void pageDataLogger(char key) {
   Serial.print(",");
   Serial.print(controls.mode,DEC);
   Serial.print(",");
-  Serial.print(controls.auxOutput,DEC);
-  Serial.print(",");
   Serial.print(execTimeRead,DEC);
   Serial.print(",");
   Serial.print(execTimeAct,DEC);
@@ -1374,8 +1401,8 @@ struct mapEditorDataStruct {
 mapEditorData;
 
 
-const unsigned char mapCurrentOutput[] PROGMEM = "Current output:";
-const unsigned char mapEditorHelp[] PROGMEM = "Press: cursor keys to move, - / + dec/inc, c/v copy/paste cell, y save";
+prog_uchar mapCurrentOutput[] PROGMEM = "Current output:";
+prog_uchar mapEditorHelp[] PROGMEM = "Press: cursor keys to move, - / + dec/inc, c/v copy/paste cell, y save";
 
 void pageMapEditor(unsigned char mapIdx,int key,boolean showCurrent=false) {    
   unsigned char *mapData = editorMaps[mapIdx];
@@ -1539,7 +1566,7 @@ void pageMapEditor(unsigned char mapIdx,int key,boolean showCurrent=false) {
 
 }
 
-const unsigned char debugHeader[] PROGMEM = "Target pres.   Actual press.  Actuator pos.  RPM  TPS";
+prog_uchar debugHeader[] PROGMEM = "Target pres.   Actual press.  Actuator pos.  RPM  TPS";
 // 0123456789012345678901234567890123456789012345678901234567890123456789
 
 
@@ -1563,19 +1590,19 @@ void pageHelp(char key) {
   }
 }
 
-const unsigned char ServoFineTunePosition[] PROGMEM = "Act. pos.: ";
-const unsigned char ServoFineTunePositionScale[] PROGMEM = "0% ----------- 25% ----------- 50% ----------- 75% -------- 100%";
+prog_uchar ServoFineTunePosition[] PROGMEM = "Act. pos.: ";
+prog_uchar ServoFineTunePositionScale[] PROGMEM = "0% ----------- 25% ----------- 50% ----------- 75% -------- 100%";
 
-const unsigned char ServoFineTuneChargePressureRequest[] PROGMEM = "Charge pressure, request:";
-const unsigned char ServoFineTuneChargePressureActual[] PROGMEM = "Charge pressure, actual:";
-const unsigned char ServoFineTuneTPS[] PROGMEM = "TPS:";
-const unsigned char ServoOutputDC[] PROGMEM = "N75 Duty Cycle:";
-const unsigned char ServoFineTuneInDamp[] PROGMEM = "In damp.:";
-const unsigned char ServoFineTuneOutDamp[] PROGMEM = "Out damp.:";
-const unsigned char ServoFineTuneP[] PROGMEM = "PID Kp:";
-const unsigned char ServoFineTuneI[] PROGMEM = "PID Ki:";
-const unsigned char ServoFineTuneD[] PROGMEM = "PID Kd:";
-const unsigned char ServoFineTuneBias[] PROGMEM = "PID Bias (10 default):";
+prog_uchar ServoFineTuneChargePressureRequest[] PROGMEM = "Charge pressure, request:";
+prog_uchar ServoFineTuneChargePressureActual[] PROGMEM = "Charge pressure, actual:";
+prog_uchar ServoFineTuneTPS[] PROGMEM = "TPS:";
+prog_uchar ServoOutputDC[] PROGMEM = "N75 Duty Cycle:";
+prog_uchar ServoFineTuneInDamp[] PROGMEM = "In damp.:";
+prog_uchar ServoFineTuneOutDamp[] PROGMEM = "Out damp.:";
+prog_uchar ServoFineTuneP[] PROGMEM = "PID Kp:";
+prog_uchar ServoFineTuneI[] PROGMEM = "PID Ki:";
+prog_uchar ServoFineTuneD[] PROGMEM = "PID Kd:";
+prog_uchar ServoFineTuneBias[] PROGMEM = "PID Bias (10 default):";
 
 void visualizeActuator(char y) {
   gotoXY(1,y);
@@ -1741,16 +1768,45 @@ void readValuesEgt() {
   // controls.temp2 = toTemperature(analogRead(PIN_TEMP2)/4); 
   controls.temp2 = 0; // disabled for now as we aren't using it
 
+  egtAvg.pos++;
+  if (egtAvg.pos>=egtAvg.size)
+    egtAvg.pos=0;
   if (controls.temp1<=0) {
-    controls.temp1 = 0;
+    egtAvg.avgData[egtAvg.pos] = 0;
   } 
   else if (controls.temp1 >= settings.egtMax) {
-    controls.temp1 = settings.egtMax;
-  }
-
+    egtAvg.avgData[egtAvg.pos] = settings.egtMax;
+  } 
+  else {
+    egtAvg.avgData[egtAvg.pos] = controls.temp1;
+  } 
 }
 
 void processValues() {
+
+  /* We aren't using this...
+   if (!controls.output1Enabled) {
+   if (controls.temp1 >= settings.output1EnableTemp) {
+   controls.output1Enabled = true;
+   }
+   } 
+   else {
+   if (controls.temp1 <= settings.output1EnableTemp-TEMP_HYSTERESIS) {
+   controls.output1Enabled = false;
+   }
+   }
+   
+   if (!controls.output2Enabled) {
+   if (controls.temp2 >= settings.output2EnableTemp) {
+   controls.output2Enabled = true;
+   }
+   } 
+   else {
+   if (controls.temp2 <= settings.output2EnableTemp-TEMP_HYSTERESIS) {
+   controls.output2Enabled = false;
+   }
+   }
+   */
 
   controls.vntMaxDc = mapLookUp(boostDCMax,controls.rpmCorrected,controls.tpsCorrected);
   controls.vntMinDc = mapLookUp(boostDCMin,controls.rpmCorrected,controls.tpsCorrected);
@@ -1763,7 +1819,8 @@ void processValues() {
   controls.tpsCorrected = mapValues(controls.tpsInput,settings.tpsMin,settings.tpsMax);
   controls.empInput = getFilteredAvarage(&empAvg);
   controls.empCorrected = mapValues(controls.empInput,settings.empMin,settings.empMax);
-  controls.egtCorrected = mapValues(controls.temp1,settings.egtMin,settings.egtMax);
+  controls.egtInput = getFilteredAvarage(&egtAvg);
+  controls.egtCorrected = mapValues(controls.egtInput,settings.egtMin,settings.egtMax);
 
   // EGT controls
   controls.auxOutput = mapLookUp(auxMap,controls.rpmCorrected,controls.egtCorrected);
@@ -1810,6 +1867,16 @@ void processValues() {
     scaledInput = 0;
   }
 
+  controls.rpmScale = (float)(settings.rpmMax - controls.rpmActual + rpmSpool) / settings.rpmMax;
+
+  if (controls.rpmScale > 1.0) {
+    controls.rpmScale = 1.0;
+  }
+  else if (controls.rpmScale < 0.0) {
+    controls.rpmScale = 0;
+  }
+
+
   if ((controls.idling)) {
     // If we are at idle then we don't want any boost regardless of map 
 
@@ -1846,13 +1913,13 @@ void processValues() {
     /* Since we do a bunch of comparisons with this value lets just calculate it once */
     float scaledError = scaledTarget - scaledInput;
 
-    if ( toKpaMAP(controls.mapCorrected) < spoolMinBoost && integral < preSpoolInt ) {
+    if ( toKpaMAP(controls.mapCorrected) < spoolMinBoost ) {
       // We haven't spooled up yet - use a static value for the integral
       // May want to add a case here for 'spooled but still at low boost'
       controls.mode = 1;              // idling
       integral = preSpoolInt;
-      // Still add proportional control like normal
-      error = Kp * scaledError;
+      // Since we aren't integrating, we will increase the proportional control
+      error = preSpoolProp;
     } else {
       // Turbo is producing pressure - now we can start actually controlling it
       if ( derivate > rampThreshold ) {
@@ -1861,14 +1928,14 @@ void processValues() {
         if (scaledError > 0) {
           // We are below setpoint
           if (scaledError < rampActive) {
-            // We haven't overshot yet but we are approaching setpoint. Reduce upwards momentum
+            // We haven't overshot yet but we are approaching setpoint. Reduce upwards momentum and stop integrating
             controls.mode = 5;                 // Under but accelerating upwards rapidly
-            integral += Ki * underGain * scaledError * timeChange; 
+            integral -= Ki * underGain * scaledError * timeChange; //make the integral go backwards
             error = Kp * underGain * scaledError;
           } else {
             // We haven't overshot and we're still somewhat far from the target. We will continue as normal. 
             controls.mode = 8;                    // Normal PID
-            if (!(controls.prevPidOutput>=0.99 && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
+            if (!(controls.prevPidOutput>=controls.rpmScale && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
               // If we are at the upper or lower limit then don't integrate, otherwise go ahead
               integral += Ki * scaledError * timeChange; 
             }
@@ -1877,7 +1944,7 @@ void processValues() {
         } else {
           // We've overshot and we're still building fast, pull back hard with proportional control, chop off the integral fast
           controls.mode = 4;                  // Overshot and still accelerating upwards
-          if (!(controls.prevPidOutput>=0.99 && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
+          if (!(controls.prevPidOutput>=controls.rpmScale && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
             integral += Ki * overGain * scaledError * timeChange;
           }
           error = Kp * overGain * scaledError;
@@ -1886,7 +1953,7 @@ void processValues() {
         if (-scaledError > maxPosErrorPct) {
           //We're quite a bit over
           controls.mode = 3;                   // Over but not steeply accelerating
-          if (!(controls.prevPidOutput>=0.99 && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
+          if (!(controls.prevPidOutput>=controls.rpmScale && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
             // If we are at the upper or lower limit then don't integrate, otherwise go ahead
             integral += Ki * overGain * scaledError * timeChange; 
           } 
@@ -1894,7 +1961,7 @@ void processValues() {
         } else if (abs(scaledError) < fineBand) {
           // We're not on a steep upwards slope and we're close to the setpoint. Switch to fine control mode, disable derivative.
           controls.mode = 7;
-          if (!(controls.prevPidOutput>=0.99 && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
+          if (!(controls.prevPidOutput>=controls.rpmScale && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
             integral += Ki * fineGain * scaledError * timeChange;
           }
           error = Kp * fineGain * scaledError;
@@ -1902,7 +1969,7 @@ void processValues() {
         } else {
           // We are spooled but everything is normal; we can use normal PID
           controls.mode = 2;                    // Normal PID
-          if (!(controls.prevPidOutput>=0.99 && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
+          if (!(controls.prevPidOutput>=controls.rpmScale && error > 0) && !(controls.prevPidOutput <= 0 && error < 0)) {
             // If we are at the upper or lower limit then don't integrate, otherwise go ahead
             integral += Ki * scaledError * timeChange; 
           }
@@ -1914,8 +1981,6 @@ void processValues() {
     /* Can't have a value below zero... */
     if ( integral < 0 ) {
       integral = 0;
-    } else if ( integral > 1 ) {
-      integral = 1;
     }
 
     /* We can bias the signal when requesting boost - do we want boost to come on faster or slower */
@@ -1982,10 +2047,15 @@ void processValues() {
 
 void updateOutputValues(bool showDebug) {
   // PWM output pins
-  analogWrite(PIN_VNT_N75,controls.vntPositionRemapped);
+  // Inverts the value at the very last minute to be correct for electronic actuator - RGE
+  controls.invertedOut = 255 - controls.vntPositionRemapped;
+  analogWrite(PIN_VNT_N75,controls.invertedOut);
+  //analogWrite(PIN_VNT_N75,controls.vntPositionRemapped);
   analogWrite(PIN_AUX_N75,controls.auxOutput);    
   /*  digitalWrite(PIN_OUTPUT1,controls.output1Enabled?HIGH:LOW);   -- Disable unused outputs for the time being
    digitalWrite(PIN_OUTPUT2,controls.output2Enabled?HIGH:LOW); */
+  
+   
 }
 
 void layoutLCD() {
@@ -2013,34 +2083,28 @@ void layoutLCD() {
 
 
 byte egtState = 0;
-byte lcdFlipFlop = 0;
 
 void updateLCD() { 
-  if (lcdFlipFlop == 1 ) {
-    // Only update half the LCD each cycle. Allow more frequent updates without disturbing control loop.
-    position_lcd(0,0);
-    printn_lcd(toKpaMAP(controls.mapCorrected),3);
+  position_lcd(0,0);
+  printn_lcd(toKpaMAP(controls.mapCorrected),3);
 
-    position_lcd(4,0);
-    /*    printn_lcd(toKpaEMP(controls.empCorrected),3); */
-    /*  Print the target pressure beside the actual pressure */
-    printn_lcd(toKpaMAP(controls.vntTargetPressure),3);
+  position_lcd(4,0);
+  /*    printn_lcd(toKpaEMP(controls.empCorrected),3); */
+  /*  Print the target pressure beside the actual pressure */
+  printn_lcd(toKpaMAP(controls.vntTargetPressure),3);
 
-    position_lcd(9,0);
-    printn_lcd(controls.rpmActual,4);
-    lcdFlipFlop = 0;
-  } else {
-    position_lcd(0,1);
-    printn_lcd(controls.temp1,3);
+  position_lcd(9,0);
+  printn_lcd(controls.rpmActual,4);
 
-    position_lcd(6,1);
-    printn_lcd(controls.tpsCorrected,3);
+  position_lcd(0,1);
+  printn_lcd(controls.temp1,3);
 
-    position_lcd(13,1);
-    printn_lcd(controls.vntPositionRemapped,3);
-    lcdFlipFlop = 1;
-  }
-  
+  position_lcd(6,1);
+  printn_lcd(controls.tpsCorrected,3);
+
+  position_lcd(13,1);
+  printn_lcd(controls.vntPositionRemapped,3);
+
   if (controls.temp1 < EGT_WARN) {
     if (egtState != 1); 
     {
