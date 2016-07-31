@@ -286,6 +286,8 @@ struct controlsStruct {
 
   unsigned long lastTime;
   float lastInput;
+  //new variable for inverted output of N75 value - RGE
+  int invertedOut;
 };
 
 controlsStruct controls;
@@ -1982,7 +1984,9 @@ void processValues() {
 
 void updateOutputValues(bool showDebug) {
   // PWM output pins
-  analogWrite(PIN_VNT_N75,controls.vntPositionRemapped);
+  controls.invertedOut = 255 - controls.vntPositionRemapped;
+  analogWrite(PIN_VNT_N75,controls.invertedOut);
+  //analogWrite(PIN_VNT_N75,controls.vntPositionRemapped);
   analogWrite(PIN_AUX_N75,controls.auxOutput);    
   /*  digitalWrite(PIN_OUTPUT1,controls.output1Enabled?HIGH:LOW);   -- Disable unused outputs for the time being
    digitalWrite(PIN_OUTPUT2,controls.output2Enabled?HIGH:LOW); */
